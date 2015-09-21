@@ -1,4 +1,4 @@
-/* eslint-disable no-new, max-len, no-comma-dangle, indent */
+/* eslint-disable no-new, max-len, no-comma-dangle, indent, max-nested-callbacks */
 
 'use strict';
 
@@ -14,7 +14,9 @@ const Amount = require('ripple-lib').Amount;
 const PathFind = require('ripple-lib')._test.PathFind;
 const Log = require('ripple-lib')._test.Log;
 
-let options, remote, callback;
+let options;
+let remote;
+let callback;
 
 const ADDRESS = 'r4qLSAzv4LZ9TLsR7diphGwKnSEAMQTSjS';
 const LEDGER_INDEX = 9592219;
@@ -2055,6 +2057,90 @@ describe('Remote', function() {
       TransactionType: 'SetRegularKey',
       Account: TX_JSON.Account,
       RegularKey: TX_JSON.Destination
+    });
+  });
+
+  it('Construct SignerListSet transaction', function() {
+    const tx = remote.createTransaction('SignerListSet', {
+      account: 'rsLEU1TPdCJPPysqhWYw9jD97xtG5WqSJm',
+      signerQuorum: 3,
+      signers: [
+        {
+          account: 'rH4KEcG9dEwGwpn6AyoWK9cZPLL4RLSmWW',
+          weight: 1
+        },
+        {
+          account: 'rPMh7Pi9ct699iZUTWaytJUoHcJ7cgyziK',
+          weight: 2
+        }
+      ]
+    });
+    assert(tx instanceof Transaction);
+    assert.deepEqual(tx.tx_json, {
+      Flags: 0,
+      TransactionType: 'SignerListSet',
+      Account: 'rsLEU1TPdCJPPysqhWYw9jD97xtG5WqSJm',
+      SignerQuorum: 3,
+      SignerEntries: [
+        {
+          SignerEntry: {
+            Account: 'rH4KEcG9dEwGwpn6AyoWK9cZPLL4RLSmWW',
+            SignerWeight: 1
+          }
+        },
+        {
+          SignerEntry: {
+            Account: 'rPMh7Pi9ct699iZUTWaytJUoHcJ7cgyziK',
+            SignerWeight: 2
+          }
+        }
+      ]
+    });
+  });
+
+  it('Construct SuspendedPaymentCreate transaction', function() {
+    const tx = remote.createTransaction('SuspendedPaymentCreate', {
+      account: TX_JSON.Account,
+      destination: TX_JSON.Destination,
+      amount: TX_JSON.Amount
+    });
+
+    assert.deepEqual(tx.tx_json, {
+      Flags: 0,
+      TransactionType: 'SuspendedPaymentCreate',
+      Account: TX_JSON.Account,
+      Destination: TX_JSON.Destination,
+      Amount: TX_JSON.Amount
+    });
+  });
+  it('Construct SuspendedPaymentFinish transaction', function() {
+    const tx = remote.createTransaction('SuspendedPaymentFinish', {
+      account: TX_JSON.Account,
+      owner: TX_JSON.Account,
+      paymentSequence: 1234
+    });
+
+    assert.deepEqual(tx.tx_json, {
+      Flags: 0,
+      TransactionType: 'SuspendedPaymentFinish',
+      Account: TX_JSON.Account,
+      Owner: TX_JSON.Account,
+      OfferSequence: 1234
+    });
+  });
+  it('Construct SuspendedPaymentCancel transaction', function() {
+    const tx = remote.createTransaction('SuspendedPaymentCancel', {
+      account: TX_JSON.Account,
+      owner: TX_JSON.Account,
+      paymentSequence: 1234
+    });
+
+    assert.deepEqual(tx.tx_json, {
+      Flags: 0,
+      TransactionType: 'SuspendedPaymentCancel',
+      Account: TX_JSON.Account,
+      Owner: TX_JSON.Account,
+      OfferSequence: 1234
     });
   });
 });

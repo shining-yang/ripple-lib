@@ -224,14 +224,16 @@ Remote.flags = {
     Passive: 0x00010000,
     Sell: 0x00020000  // offer was placed as a sell
   },
-  // Ripple tate
+  // Ripple state
   state: {
     LowReserve: 0x00010000, // entry counts toward reserve
     HighReserve: 0x00020000,
     LowAuth: 0x00040000,
     HighAuth: 0x00080000,
     LowNoRipple: 0x00100000,
-    HighNoRipple: 0x00200000
+    HighNoRipple: 0x00200000,
+    LowFreeze: 0x00400000,
+    HighFreeze: 0x00800000
   }
 };
 
@@ -2150,12 +2152,16 @@ Remote.prototype.requestPathFindClose = function(callback) {
   const request = new Request(this, 'path_find');
 
   request.message.subcommand = 'close';
-  request.callback(callback);
-  this._cur_path_find = null;
-  if (this._queued_path_finds.length > 0) {
-    const pathfind = this._queued_path_finds.shift();
-    this.createPathFind(pathfind.options, pathfind.callback);
-  }
+  request.callback((error, data) => {
+    this._cur_path_find = null;
+    if (this._queued_path_finds.length > 0) {
+      const pathfind = this._queued_path_finds.shift();
+      this.createPathFind(pathfind.options, pathfind.callback);
+    }
+    if (callback) {
+      callback(error, data);
+    }
+  });
 
   return request;
 };
@@ -2271,7 +2277,11 @@ Remote.prototype.createTransaction = function(type, options = {}) {
     TrustSet: transaction.trustSet,
     OfferCreate: transaction.offerCreate,
     OfferCancel: transaction.offerCancel,
-    SetRegularKey: transaction.setRegularKey
+    SetRegularKey: transaction.setRegularKey,
+    SignerListSet: transaction.setSignerList,
+    SuspendedPaymentCreate: transaction.suspendedPaymentCreate,
+    SuspendedPaymentFinish: transaction.suspendedPaymentFinish,
+    SuspendedPaymentCancel: transaction.suspendedPaymentCancel
   };
 
   const transactionConstructor = constructorMap[type];

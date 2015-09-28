@@ -7,17 +7,16 @@ const assert = require('assert');
 const extend = require('extend');
 const utils = require('./utils');
 const UInt160 = require('./uint160').UInt160;
-const Seed = require('./seed').Seed;
 const Currency = require('./currency').Currency;
-const Value = require('./value').Value;
-const IOUValue = require('./iouvalue').IOUValue;
-const XRPValue = require('./xrpvalue').XRPValue;
+const {XRPValue, IOUValue} = require('ripple-lib-value');
+
+type Value = XRPValue | IOUValue;
 
 function Amount(value = new XRPValue(NaN)) {
   // Json format:
   //  integer : XRP
   //  { 'value' : ..., 'currency' : ..., 'issuer' : ...}
-  assert(value instanceof Value);
+  assert(value instanceof XRPValue || value instanceof IOUValue);
 
   this._value = value;
   this._is_native = true; // Default to XRP. Only valid if value is not NaN.
@@ -626,7 +625,8 @@ function(quality, counterCurrency, counterIssuer, opts) {
   }
   if (this._is_native) {
     this._set_value(
-      new XRPValue(nativeAdjusted.round(6, Value.getBNRoundDown()).toString()));
+      new XRPValue(nativeAdjusted.round(6, XRPValue.getBNRoundDown())
+        .toString()));
   } else {
     this._set_value(nativeAdjusted);
   }
@@ -724,7 +724,7 @@ Amount.prototype.parse_native = function(j) {
 // Requires _currency to be set!
 Amount.prototype.parse_value = function(j) {
   this._is_native = false;
-  const newValue = new IOUValue(j, Value.getBNRoundDown());
+  const newValue = new IOUValue(j, IOUValue.getBNRoundDown());
   this._set_value(newValue);
   return this;
 };
@@ -1008,10 +1008,4 @@ Amount.prototype.not_equals_why = function(d, ignore_issuer) {
 };
 
 exports.Amount = Amount;
-
-// DEPRECATED: Include the corresponding files instead.
-exports.Currency = Currency;
-exports.Seed = Seed;
-exports.UInt160 = UInt160;
-
 // vim:sw=2:sts=2:ts=8:et

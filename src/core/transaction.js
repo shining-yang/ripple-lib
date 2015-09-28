@@ -3,14 +3,13 @@
 const assert = require('assert');
 const util = require('util');
 const _ = require('lodash');
+const {deriveKeypair, sign} = require('ripple-keypairs');
 const EventEmitter = require('events').EventEmitter;
 const utils = require('./utils');
 const sjclcodec = require('sjcl-codec');
 const Amount = require('./amount').Amount;
-const Currency = require('./amount').Currency;
-const UInt160 = require('./amount').UInt160;
-const Seed = require('./seed').Seed;
-const KeyPair = require('ripple-keypairs').KeyPair;
+const Currency = require('./currency').Currency;
+const UInt160 = require('./uint160').UInt160;
 const SerializedObject = require('./serializedobject').SerializedObject;
 const RippleError = require('./rippleerror').RippleError;
 const hashprefixes = require('./hashprefixes');
@@ -45,6 +44,7 @@ function Transaction(remote) {
   ? this.remote.automatic_resubmission
   : true;
   this._maxFee = remoteExists ? this.remote.max_fee : undefined;
+  this._lastLedgerOffset = remoteExists ? this.remote.last_ledger_offset : 3;
   this.state = 'unsubmitted';
   this.finalized = false;
   this.previousSigningHash = undefined;
@@ -429,31 +429,12 @@ Transaction.prototype.complete = function() {
   return this.tx_json;
 };
 
-Transaction.prototype.getKeyPair = function(secret_) {
-  if (this._keyPair) {
-    return this._keyPair;
-  }
-
-  const secret = secret_ || this._secret;
-  assert(secret, 'Secret missing');
-
-  const keyPair = Seed.from_json(secret).get_key();
-  this._keyPair = keyPair;
-
-  return keyPair;
-};
-
 Transaction.prototype.getSigningPubKey = function(secret) {
-  return this.getKeyPair(secret).pubKeyHex();
+  return deriveKeypair(secret || this._secret).publicKey;
 };
 
 Transaction.prototype.setSigningPubKey = function(key) {
-  if (_.isString(key)) {
-    this.tx_json.SigningPubKey = key;
-  } else if (key instanceof KeyPair) {
-    this.tx_json.SigningPubKey = key.pubKeyHex();
-  }
-
+  this.tx_json.SigningPubKey = key;
   return this;
 };
 
@@ -508,16 +489,13 @@ Transaction.prototype.hash = function(prefix_, asUINT256, serialized) {
   return asUINT256 ? hash : hash.to_hex();
 };
 
-Transaction.prototype.sign = function() {
+Transaction.prototype.sign = function(secret) {
   if (this.hasMultiSigners()) {
     return this;
   }
 
-  const keyPair = this.getKeyPair();
   const prev_sig = this.tx_json.TxnSignature;
-
   delete this.tx_json.TxnSignature;
-
   const hash = this.signingHash();
 
   // If the hash is the same, we can re-use the previous signature
@@ -526,7 +504,9 @@ Transaction.prototype.sign = function() {
     return this;
   }
 
-  this.tx_json.TxnSignature = keyPair.signHex(this.signingData().buffer);
+  const keypair = deriveKeypair(secret || this._secret);
+  this.tx_json.TxnSignature = sign(this.signingData().buffer,
+    keypair.privateKey);
   this.previousSigningHash = hash;
 
   return this;
@@ -582,19 +562,30 @@ Transaction.prototype.clientID = function(id) {
   return this;
 };
 
-/**
- * Set LastLedgerSequence as the absolute last ledger sequence the transaction
- * is valid for. LastLedgerSequence is set automatically if not set using this
- * method
- *
- * @param {Number} ledger index
- */
+Transaction.prototype.setLastLedgerSequenceOffset = function(offset) {
+  this._lastLedgerOffset = offset;
+};
 
-Transaction.prototype.setLastLedgerSequence =
+Transaction.prototype.getLastLedgerSequenceOffset = function() {
+  return this._lastLedgerOffset;
+};
+
+Transaction.prototype.lastLedger =
 Transaction.prototype.setLastLedger =
-Transaction.prototype.lastLedger = function(sequence) {
-  this._setUInt32('LastLedgerSequence', sequence);
+Transaction.prototype.setLastLedgerSequence = function(sequence) {
+  if (!_.isUndefined(sequence)) {
+    this._setUInt32('LastLedgerSequence', sequence);
+  } else {
+    // Autofill LastLedgerSequence
+    assert(this.remote, 'Unable to set LastLedgerSequence, missing Remote');
+
+    this._setUInt32('LastLedgerSequence',
+                    this.remote.getLedgerSequence() + 1
+                    + this.getLastLedgerSequenceOffset());
+  }
+
   this._setLastLedger = true;
+
   return this;
 };
 
@@ -1479,7 +1470,7 @@ Transaction.prototype.summary = function() {
     submissionAttempts: this.attempts,
     submitIndex: this.submitIndex,
     initialSubmitIndex: this.initialSubmitIndex,
-    lastLedgerSequence: this.lastLedgerSequence,
+    lastLedgerSequence: this.tx_json.LastLedgerSequence,
     state: this.state,
     finalized: this.finalized
   };
@@ -1616,30 +1607,44 @@ Transaction.prototype.setSigners = function(signers) {
 Transaction.prototype.addMultiSigner = function(signer) {
   assert(UInt160.is_valid(signer.Account), 'Signer must have a valid Account');
 
-  if (_.isUndefined(this.multi_signers)) {
-    this.multi_signers = [];
+  if (_.isUndefined(this.tx_json.Signers)) {
+    this.tx_json.Signers = [];
   }
 
-  this.multi_signers.push({Signer: signer});
+  this.tx_json.Signers.push({Signer: signer});
 
-  this.multi_signers.sort((a, b) => {
+  this.tx_json.Signers.sort((a, b) => {
     return UInt160.from_json(a.Signer.Account)
     .cmp(UInt160.from_json(b.Signer.Account));
   });
+
+  return this;
 };
 
 Transaction.prototype.hasMultiSigners = function() {
-  return !_.isEmpty(this.multi_signers);
+  return !_.isEmpty(this.tx_json.Signers);
 };
+
 Transaction.prototype.getMultiSigners = function() {
-  return this.multi_signers;
+  return this.tx_json.Signers;
 };
 
 Transaction.prototype.getMultiSigningJson = function() {
   assert(this.tx_json.Sequence, 'Sequence must be set before multi-signing');
   assert(this.tx_json.Fee, 'Fee must be set before multi-signing');
 
-  const signingTx = Transaction.from_json(this.tx_json);
+  if (_.isUndefined(this.tx_json.LastLedgerSequence)) {
+    // Auto-fill LastLedgerSequence
+    this.setLastLedgerSequence();
+  }
+
+  const cleanedJson = _.omit(this.tx_json, [
+    'SigningPubKey',
+    'Signers',
+    'TxnSignature'
+  ]);
+
+  const signingTx = Transaction.from_json(cleanedJson);
   signingTx.remote = this.remote;
   signingTx.setSigningPubKey('');
   signingTx.setCanonicalFlag();
@@ -1649,12 +1654,12 @@ Transaction.prototype.getMultiSigningJson = function() {
 
 Transaction.prototype.multiSign = function(account, secret) {
   const signingData = this.multiSigningData(account);
-  const keyPair = Seed.from_json(secret).get_key();
+  const keypair = deriveKeypair(secret);
 
   const signer = {
     Account: account,
-    TxnSignature: keyPair.signHex(signingData.buffer),
-    SigningPubKey: keyPair.pubKeyHex()
+    TxnSignature: sign(signingData.buffer, keypair.privateKey),
+    SigningPubKey: keypair.publicKey
   };
 
   return signer;

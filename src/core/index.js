@@ -9,7 +9,6 @@ exports.Base = require('./base').Base;
 exports.UInt128 = require('./uint128').UInt128;
 exports.UInt160 = require('./uint160').UInt160;
 exports.UInt256 = require('./uint256').UInt256;
-exports.Seed = require('./seed').Seed;
 exports.Meta = require('./meta').Meta;
 exports.SerializedObject = require('./serializedobject').SerializedObject;
 exports.RippleError = require('./rippleerror').RippleError;
@@ -21,7 +20,6 @@ exports.TransactionQueue = require('./transactionqueue').TransactionQueue;
 exports.convertBase = require('./baseconverter');
 
 exports._test = {
-  IOUValue: require('./iouvalue').IOUValue,
   Log: require('./log'),
   PathFind: require('./pathfind').PathFind,
   TransactionManager: require('./transactionmanager').TransactionManager,

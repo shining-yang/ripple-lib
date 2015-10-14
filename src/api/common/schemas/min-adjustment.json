@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "minAdjustment",
+  "type": "object",
+  "properties": {
+    "address": {"$ref": "address"},
+    "minAmount": {"$ref": "laxAmount"},
+    "tag": {"$ref": "tag"}
+  },
+  "required": ["address", "minAmount"],
+  "additionalProperties": false
+}

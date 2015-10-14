@@ -18,13 +18,12 @@ const assert = require('assert');
 const _ = require('lodash');
 const LRU = require('lru-cache');
 const async = require('async');
+const constants = require('./constants');
 const EventEmitter = require('events').EventEmitter;
 const Server = require('./server').Server;
 const Request = require('./request').Request;
 const Amount = require('./amount').Amount;
 const Currency = require('./currency').Currency;
-const UInt160 = require('./uint160').UInt160;
-const UInt256 = require('./uint256').UInt256;
 const Transaction = require('./transaction').Transaction;
 const Account = require('./account').Account;
 const Meta = require('./meta').Meta;
@@ -35,6 +34,9 @@ const RippleError = require('./rippleerror').RippleError;
 const utils = require('./utils');
 const hashprefixes = require('./hashprefixes');
 const log = require('./log').internal.sub('remote');
+const {isValidAddress} = require('ripple-address-codec');
+
+export type GetLedgerSequenceCallback = (err?: ?Error, index?: number) => void;
 
 /**
  * Interface to manage connections to rippled servers
@@ -136,6 +138,9 @@ function Remote(options = {}) {
   if (typeof this.submission_timeout !== 'number') {
     throw new TypeError('submission_timeout must be a number');
   }
+  if (typeof this.pathfind_timeout !== 'number') {
+    throw new TypeError('pathfind_timeout must be a number');
+  }
   if (typeof this.automatic_resubmission !== 'boolean') {
     throw new TypeError('automatic_resubmission must be a boolean');
   }
@@ -195,6 +200,7 @@ Remote.DEFAULTS = {
   max_fee: 1000000, // 1 XRP
   max_attempts: 10,
   submission_timeout: 1000 * 20,
+  pathfind_timeout: 1000 * 10,
   automatic_resubmission: true,
   last_ledger_offset: 3,
   servers: [ ],
@@ -518,7 +524,34 @@ Remote.prototype._handleMessage = function(message, server) {
   }
 };
 
-Remote.prototype.getLedgerSequence = function() {
+/**
+ *
+ * @param {Function} [callback]
+ * @api public
+ */
+
+Remote.prototype.getLedgerSequence = function(callback = function() {}) {
+  if (!this._servers.length) {
+    callback(new Error('No servers available.'));
+    return;
+  }
+
+  if (_.isFinite(this._ledger_current_index)) {
+    // the "current" ledger is the one after the most recently closed ledger
+    callback(null, this._ledger_current_index - 1);
+  } else {
+    this.once('ledger_closed', () => {
+      callback(null, this._ledger_current_index - 1);
+    });
+  }
+};
+
+/**
+ *
+ * @api private
+ */
+
+Remote.prototype.getLedgerSequenceSync = function(): number {
   if (!this._ledger_current_index) {
     throw new Error('Ledger sequence has not yet been initialized');
   }
@@ -1159,9 +1192,13 @@ Remote.prototype.requestTransaction = function(options, callback) {
  * @throws {Error} if a marker is provided, but no ledger_index or ledger_hash
  */
 
+function isValidLedgerHash(hash) {
+  return /^[A-F0-9]{64}$/.test(hash);
+}
+
 Remote.prototype._accountRequest = function(command, options, callback) {
   if (options.marker) {
-    if (!(Number(options.ledger) > 0) && !UInt256.is_valid(options.ledger)) {
+    if (!(Number(options.ledger) > 0) && !isValidLedgerHash(options.ledger)) {
       throw new Error(
         'A ledger_index or ledger_hash must be provided when using a marker');
     }
@@ -1169,11 +1206,11 @@ Remote.prototype._accountRequest = function(command, options, callback) {
 
   const request = new Request(this, command);
 
-  request.message.account = UInt160.json_rewrite(options.account);
+  request.message.account = options.account;
   request.selectLedger(options.ledger);
 
-  if (UInt160.is_valid(options.peer)) {
-    request.message.peer = UInt160.json_rewrite(options.peer);
+  if (isValidAddress(options.peer)) {
+    request.message.peer = options.peer;
   }
 
   if (!isNaN(options.limit)) {
@@ -1501,7 +1538,7 @@ Remote.prototype.requestBookOffers = function(options, callback) {
   };
 
   if (!Currency.from_json(request.message.taker_gets.currency).is_native()) {
-    request.message.taker_gets.issuer = UInt160.json_rewrite(taker_gets.issuer);
+    request.message.taker_gets.issuer = taker_gets.issuer;
   }
 
   request.message.taker_pays = {
@@ -1509,10 +1546,10 @@ Remote.prototype.requestBookOffers = function(options, callback) {
   };
 
   if (!Currency.from_json(request.message.taker_pays.currency).is_native()) {
-    request.message.taker_pays.issuer = UInt160.json_rewrite(taker_pays.issuer);
+    request.message.taker_pays.issuer = taker_pays.issuer;
   }
 
-  request.message.taker = taker ? taker : UInt160.ACCOUNT_ONE;
+  request.message.taker = taker ? taker : constants.ACCOUNT_ONE;
   request.selectLedger(ledger);
 
   if (!isNaN(limit)) {
@@ -1746,7 +1783,7 @@ Remote.prototype.requestOwnerCount = function(options, callback) {
  */
 
 Remote.prototype.getAccount = function(accountID) {
-  return this._accounts[UInt160.json_rewrite(accountID)];
+  return this._accounts[accountID];
 };
 
 /**
@@ -1781,6 +1818,19 @@ Remote.prototype.findAccount = function(accountID) {
 };
 
 /**
+ * Closes current pathfind, if there is one.
+ * After that new pathfind can be created, without adding to queue.
+ *
+ * @return {void} -
+ */
+Remote.prototype.closeCurrentPathFind = function() {
+  if (this._cur_path_find !== null) {
+    this._cur_path_find.close();
+    this._cur_path_find = null;
+  }
+};
+
+/**
  * Create a pathfind
  *
  * @param {Object} options -
@@ -1789,26 +1839,51 @@ Remote.prototype.findAccount = function(accountID) {
  */
 Remote.prototype.createPathFind = function(options, callback) {
   if (this._cur_path_find !== null) {
+    if (callback === undefined) {
+      throw new Error('Only one streaming pathfind ' +
+                      'request at a time is supported');
+    }
     this._queued_path_finds.push({options, callback});
     return null;
   }
 
   const pathFind = new PathFind(this,
     options.src_account, options.dst_account,
-    options.dst_amount, options.src_currencies);
+    options.dst_amount, options.src_currencies, options.src_amount);
 
   if (this._cur_path_find) {
     this._cur_path_find.notify_superceded();
   }
 
   if (callback) {
+    const updateTimeout = setTimeout(() => {
+      callback(new RippleError('tejTimeout'));
+      pathFind.close();
+      this._cur_path_find = null;
+    }, this.pathfind_timeout);
+
     pathFind.on('update', (data) => {
-      if (data.full_reply) {
-        pathFind.close();
+      if (data.full_reply && !data.closed) {
+        clearTimeout(updateTimeout);
+        this._cur_path_find = null;
         callback(null, data);
+        // "A client can only have one pathfinding request open at a time.
+        // If another pathfinding request is already open on the same
+        // connection, the old request is automatically closed and replaced
+        // with the new request."
+        // - ripple.com/build/rippled-apis/#path-find-create
+        if (this._queued_path_finds.length > 0) {
+          const pathfind = this._queued_path_finds.shift();
+          this.createPathFind(pathfind.options, pathfind.callback);
+        } else {
+          pathFind.close();
+        }
       }
     });
-    pathFind.on('error', callback);
+    pathFind.on('error', (error) => {
+      this._cur_path_find = null;
+      callback(error);
+    });
   }
 
   this._cur_path_find = pathFind;
@@ -1859,8 +1934,7 @@ Remote.prototype.book = Remote.prototype.createOrderBook = function(options) {
  */
 
 Remote.prototype.accountSeq =
-Remote.prototype.getAccountSequence = function(account_, advance) {
-  const account = UInt160.json_rewrite(account_);
+Remote.prototype.getAccountSequence = function(account, advance) {
   const accountInfo = this.accounts[account];
 
   if (!accountInfo) {
@@ -1883,9 +1957,7 @@ Remote.prototype.getAccountSequence = function(account_, advance) {
  */
 
 Remote.prototype.setAccountSequence =
-Remote.prototype.setAccountSeq = function(account_, sequence) {
-  const account = UInt160.json_rewrite(account_);
-
+Remote.prototype.setAccountSeq = function(account, sequence) {
   if (!this.accounts.hasOwnProperty(account)) {
     this.accounts[account] = { };
   }
@@ -1951,8 +2023,7 @@ Remote.prototype.accountSeqCache = function(options, callback) {
  * @param {String} account
  */
 
-Remote.prototype.dirtyAccountRoot = function(account_) {
-  const account = UInt160.json_rewrite(account_);
+Remote.prototype.dirtyAccountRoot = function(account) {
   delete this.ledgers.current.account_root[account];
 };
 
@@ -2025,8 +2096,7 @@ Remote.prototype.requestRippleBalance = function(options, callback) {
 
     // accountHigh implies for account: balance is negated.  highLimit is the
     // limit set by account.
-    const accountHigh = UInt160.from_json(options.account)
-    .equals(highLimit.issuer());
+    const accountHigh = (options.account === highLimit.issuer());
 
     request.emit('ripple_state', {
       account_balance: (accountHigh
@@ -2067,7 +2137,7 @@ Remote.prepareCurrencies = function(currency) {
   const newCurrency = { };
 
   if (currency.hasOwnProperty('issuer')) {
-    newCurrency.issuer = UInt160.json_rewrite(currency.issuer);
+    newCurrency.issuer = currency.issuer;
   }
 
   if (currency.hasOwnProperty('currency')) {
@@ -2088,12 +2158,8 @@ Remote.prepareCurrencies = function(currency) {
 
 Remote.prototype.requestRipplePathFind = function(options, callback) {
   const request = new Request(this, 'ripple_path_find');
-
-  request.message.source_account = UInt160.json_rewrite(options.source_account);
-
-  request.message.destination_account =
-    UInt160.json_rewrite(options.destination_account);
-
+  request.message.source_account = options.source_account;
+  request.message.destination_account = options.destination_account;
   request.message.destination_amount =
     Amount.json_rewrite(options.destination_amount);
 
@@ -2119,17 +2185,18 @@ Remote.prototype.requestPathFindCreate = function(options, callback) {
   const request = new Request(this, 'path_find');
   request.message.subcommand = 'create';
 
-  request.message.source_account = UInt160.json_rewrite(options.source_account);
-
-  request.message.destination_account =
-    UInt160.json_rewrite(options.destination_account);
-
+  request.message.source_account = options.source_account;
+  request.message.destination_account = options.destination_account;
   request.message.destination_amount =
     Amount.json_rewrite(options.destination_amount);
 
   if (Array.isArray(options.source_currencies)) {
     request.message.source_currencies =
       options.source_currencies.map(Remote.prepareCurrency);
+  }
+
+  if (options.send_max) {
+    request.message.send_max = Amount.json_rewrite(options.send_max);
   }
 
   request.callback(callback);
@@ -2145,19 +2212,8 @@ Remote.prototype.requestPathFindCreate = function(options, callback) {
 
 Remote.prototype.requestPathFindClose = function(callback) {
   const request = new Request(this, 'path_find');
-
   request.message.subcommand = 'close';
-  request.callback((error, data) => {
-    this._cur_path_find = null;
-    if (this._queued_path_finds.length > 0) {
-      const pathfind = this._queued_path_finds.shift();
-      this.createPathFind(pathfind.options, pathfind.callback);
-    }
-    if (callback) {
-      callback(error, data);
-    }
-  });
-
+  request.callback(callback);
   return request;
 };
 
@@ -2247,6 +2303,29 @@ Remote.prototype.requestConnect = function(ip, port, callback) {
   return request;
 };
 
+Remote.prototype.requestGatewayBalances = function(options, callback) {
+  assert(_.isObject(options), 'Options missing');
+  assert(options.account, 'Account missing');
+
+  const request = new Request(this, 'gateway_balances');
+
+  request.message.account = options.account;
+
+  if (!_.isUndefined(options.hotwallet)) {
+    request.message.hotwallet = options.hotwallet;
+  }
+  if (!_.isUndefined(options.strict)) {
+    request.message.strict = options.strict;
+  }
+  if (!_.isUndefined(options.ledger)) {
+    request.selectLedger(options.ledger);
+  }
+
+  request.callback(callback);
+
+  return request;
+};
+
 /**
  * Create a Transaction
  *
@@ -2305,6 +2384,32 @@ Remote.prototype.feeTx = function(units) {
   }
 
   return server._feeTx(units);
+};
+
+/**
+ * Same as feeTx, but will wait to connect to server if currently
+ * disconnected.
+ *
+ * @param {Number} fee units
+ * @param {Function} callback
+ */
+
+Remote.prototype.feeTxAsync = function(units, callback) {
+  if (!this._servers.length) {
+    callback(new Error('No servers available.'));
+    return;
+  }
+
+  let server = this.getServer();
+
+  if (!server) {
+    this.once('connected', () => {
+      server = this.getServer();
+      callback(null, server._feeTx(units));
+    });
+  } else {
+    callback(null, server._feeTx(units));
+  }
 };
 
 /**

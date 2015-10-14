@@ -2,12 +2,11 @@
 
 const _ = require('lodash');
 const assert = require('assert');
-const SerializedObject = require('./serializedobject').SerializedObject;
-const Types = require('./serializedtypes');
+const constants = require('./constants');
 const Amount = require('./amount').Amount;
 const Currency = require('./currency').Currency;
-const UInt160 = require('./uint160').UInt160;
 const {IOUValue} = require('ripple-lib-value');
+const binary = require('ripple-binary-codec');
 const OrderBookUtils = {};
 
 function assertValidNumber(number, message) {
@@ -22,15 +21,12 @@ function assertValidNumber(number, message) {
 * @return JSON amount object
 */
 
-function createAmount(value, currency_, counterparty_) {
+function createAmount(value, currency_, counterparty) {
+  assert(_.isString(counterparty), 'counterparty must be a string');
 
   const currency = currency_ instanceof Currency ?
     currency_ :
     Currency.from_json(currency_);
-
-  const counterparty = counterparty_ instanceof UInt160 ?
-    counterparty_ :
-    UInt160.from_json(counterparty_);
 
   return Amount.from_components_unsafe(new IOUValue(value),
     currency, counterparty, false);
@@ -146,11 +142,7 @@ OrderBookUtils.getOfferQuality = function(offer, currencyGets, currency_,
 
 OrderBookUtils.convertOfferQualityToHex = function(quality) {
   assert(quality instanceof Amount, 'Quality is not an amount');
-
-  const so = new SerializedObject();
-  Types.Quality.serialize(so, quality.to_text());
-
-  return so.to_hex();
+  return OrderBookUtils.convertOfferQualityToHex(quality.to_text());
 };
 
 /**
@@ -163,17 +155,12 @@ OrderBookUtils.convertOfferQualityToHex = function(quality) {
  */
 
 OrderBookUtils.convertOfferQualityToHexFromText = function(quality) {
-
-  const so = new SerializedObject();
-  Types.Quality.serialize(so, quality);
-
-  return so.to_hex();
+  return binary.encodeQuality(quality);
 };
-
 
 OrderBookUtils.CURRENCY_ONE = Currency.from_json(1);
 
-OrderBookUtils.ISSUER_ONE = UInt160.from_json(1);
+OrderBookUtils.ISSUER_ONE = constants.ACCOUNT_ONE;
 
 /**
  *

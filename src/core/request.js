@@ -4,7 +4,6 @@ const _ = require('lodash');
 const EventEmitter = require('events').EventEmitter;
 const util = require('util');
 const async = require('async');
-const UInt160 = require('./uint160').UInt160;
 const Currency = require('./currency').Currency;
 const RippleError = require('./rippleerror').RippleError;
 
@@ -34,23 +33,29 @@ function Request(remote, command) {
     command: command,
     id: undefined
   };
+  this._timeout = this.remote.submission_timeout;
 }
 
 util.inherits(Request, EventEmitter);
 
 // Send the request to a remote.
 Request.prototype.request = function(servers, callback_) {
-  const self = this;
   const callback = typeof servers === 'function' ? servers : callback_;
+  const self = this;
+
+  if (this.requested) {
+    throw new Error('Already requested');
+  }
 
   this.emit('before');
-  this.callback(callback);
-
+  // emit handler can set requested flag
   if (this.requested) {
     return this;
   }
 
   this.requested = true;
+  this.callback(callback);
+
   this.on('error', function() {});
   this.emit('request', this.remote);
 
@@ -65,18 +70,32 @@ Request.prototype.request = function(servers, callback_) {
     }
   }
 
-  function onReconnect() {
-    doRequest();
-  }
+  const timeout = setTimeout(() => {
+    if (typeof callback === 'function') {
+      callback(new RippleError('tejTimeout'));
+    }
 
-  function onResponse() {
-    self.remote.removeListener('connected', onReconnect);
-  }
+    this.emit('timeout');
+    // just in case
+    this.emit = _.noop;
+    this.cancel();
+    this.remote.removeListener('connected', doRequest);
+  }, this._timeout);
 
   if (this.remote.isConnected()) {
-    this.remote.on('connected', onReconnect);
+    this.remote.on('connected', doRequest);
   }
-  this.once('response', onResponse);
+
+  function onRemoteError(error) {
+    self.emit('error', error);
+  }
+  this.remote.once('error', onRemoteError); // e.g. rate-limiting slowDown error
+
+  this.once('response', () => {
+    clearTimeout(timeout);
+    this.remote.removeListener('connected', doRequest);
+    this.remote.removeListener('error', onRemoteError);
+  });
 
   doRequest();
 
@@ -113,6 +132,7 @@ Request.prototype.broadcast = function(isResponseSuccess = isResponseNotError) {
     return this;
   }
 
+  this.on('error', function() {});
   let lastResponse = new Error('No servers available');
   const connectTimeouts = { };
   const emit = this.emit;
@@ -129,23 +149,44 @@ Request.prototype.broadcast = function(isResponseSuccess = isResponseNotError) {
     }
   };
 
+  let serversCallbacks = { };
+  let serversTimeouts = { };
+  let serversClearConnectHandlers = { };
+
   function iterator(server, callback) {
     // Iterator is called in parallel
 
-    if (server.isConnected()) {
-      // Listen for proxied success/error event and apply filter
-      self.once('proposed', function(res) {
-        lastResponse = res;
-        callback(isResponseSuccess(res));
-      });
+    const serverID = server.getServerID();
 
+    serversCallbacks[serverID] = callback;
+
+    function doRequest() {
       return server._request(self);
+    }
+
+    if (server.isConnected()) {
+      const timeout = setTimeout(() => {
+        lastResponse = new RippleError('tejTimeout',
+          JSON.stringify(self.message));
+
+        server.removeListener('connect', doRequest);
+        delete serversCallbacks[serverID];
+        delete serversClearConnectHandlers[serverID];
+
+        callback(false);
+      }, self._timeout);
+
+      serversTimeouts[serverID] = timeout;
+      serversClearConnectHandlers[serverID] = function() {
+        server.removeListener('connect', doRequest);
+      };
+
+      server.on('connect', doRequest);
+      return doRequest();
     }
 
     // Server is disconnected but should reconnect. Wait for it to reconnect,
     // and abort after a timeout
-    const serverID = server.getServerID();
-
     function serverReconnected() {
       clearTimeout(connectTimeouts[serverID]);
       connectTimeouts[serverID] = null;
@@ -160,12 +201,58 @@ Request.prototype.broadcast = function(isResponseSuccess = isResponseNotError) {
     server.once('connect', serverReconnected);
   }
 
+  // Listen for proxied success/error event and apply filter
+  function onProposed(result, server) {
+    const serverID = server.getServerID();
+    lastResponse = result;
+
+    const callback = serversCallbacks[serverID];
+    delete serversCallbacks[serverID];
+
+    clearTimeout(serversTimeouts[serverID]);
+    delete serversTimeouts[serverID];
+
+    if (serversClearConnectHandlers[serverID] !== undefined) {
+      serversClearConnectHandlers[serverID]();
+      delete serversClearConnectHandlers[serverID];
+    }
+
+    if (callback !== undefined) {
+      callback(isResponseSuccess(result));
+    }
+  }
+
+  this.on('proposed', onProposed);
+
+  let complete_ = null;
+
+  // e.g. rate-limiting slowDown error
+  function onRemoteError(error) {
+    serversCallbacks = {};
+    _.forEach(serversTimeouts, clearTimeout);
+    serversTimeouts = {};
+    _.forEach(serversClearConnectHandlers, (handler) => {
+      handler();
+    });
+    serversClearConnectHandlers = {};
+
+    lastResponse = error instanceof RippleError ? error :
+      new RippleError(error);
+    complete_(false);
+  }
+
   function complete(success) {
+    self.removeListener('proposed', onProposed);
+    self.remote.removeListener('error', onRemoteError);
     // Emit success if the filter is satisfied by any server
     // Emit error if the filter is not satisfied by any server
     // Include the last response
     emit.call(self, success ? 'success' : 'error', lastResponse);
   }
+
+  complete_ = complete;
+
+  this.remote.once('error', onRemoteError);
 
   const servers = this.remote._servers.filter(function(server) {
     // Pre-filter servers that are disconnected and should not reconnect
@@ -228,7 +315,6 @@ Request.prototype.callback = function(callback, successEvent, errorEvent) {
   let called = false;
 
   function requestError(error) {
-    self.remote.removeListener('error', requestError);
     if (!called) {
       called = true;
 
@@ -241,14 +327,12 @@ Request.prototype.callback = function(callback, successEvent, errorEvent) {
   }
 
   function requestSuccess(message) {
-    self.remote.removeListener('error', requestError);
     if (!called) {
       called = true;
       callback.call(self, null, message);
     }
   }
 
-  this.remote.once('error', requestError); // e.g. rate-limiting slowDown error
   this.once(this.successEvent, requestSuccess);
   this.once(this.errorEvent, requestError);
 
@@ -259,38 +343,11 @@ Request.prototype.callback = function(callback, successEvent, errorEvent) {
   return this;
 };
 
-Request.prototype.timeout = function(duration, callback) {
-  const self = this;
-
-  function requested() {
-    self.timeout(duration, callback);
+Request.prototype.setTimeout = function(delay) {
+  if (!_.isFinite(delay)) {
+    throw new Error('delay must be number');
   }
-
-  if (!this.requested) {
-    // Defer until requested
-    return this.once('request', requested);
-  }
-
-  const emit = this.emit;
-  let timed_out = false;
-
-  const timeout = setTimeout(function() {
-    timed_out = true;
-
-    if (typeof callback === 'function') {
-      callback();
-    }
-
-    emit.call(self, 'timeout');
-    self.cancel();
-  }, duration);
-
-  this.emit = function() {
-    if (!timed_out) {
-      clearTimeout(timeout);
-      emit.apply(self, arguments);
-    }
-  };
+  this._timeout = delay;
 
   return this;
 };
@@ -383,7 +440,7 @@ Request.prototype.selectLedger = function(ledger, defaultValue) {
 };
 
 Request.prototype.accountRoot = function(account) {
-  this.message.account_root = UInt160.json_rewrite(account);
+  this.message.account_root = account;
   return this;
 };
 
@@ -397,7 +454,7 @@ Request.prototype.index = function(index) {
 // --> seq : sequence number of transaction creating offer (integer)
 Request.prototype.offerId = function(account, sequence) {
   this.message.offer = {
-    account: UInt160.json_rewrite(account),
+    account: account,
     seq: sequence
   };
   return this;
@@ -435,8 +492,8 @@ Request.prototype.rippleState = function(account, issuer, currency) {
   this.message.ripple_state = {
     currency: currency,
     accounts: [
-      UInt160.json_rewrite(account),
-      UInt160.json_rewrite(issuer)
+      account,
+      issuer
     ]
   };
   return this;
@@ -448,7 +505,7 @@ Request.prototype.accounts = function(accountsIn, proposed) {
 
   // Process accounts parameters
   const processedAccounts = accounts.map(function(account) {
-    return UInt160.json_rewrite(account);
+    return account;
   });
 
   if (proposed) {
@@ -466,7 +523,7 @@ Request.prototype.addAccount = function(account, proposed) {
     return this;
   }
 
-  const processedAccount = UInt160.json_rewrite(account);
+  const processedAccount = account;
   const prop = proposed === true ? 'accounts_proposed' : 'accounts';
   this.message[prop] = (this.message[prop] || []).concat(processedAccount);
 
@@ -521,7 +578,7 @@ Request.prototype.addBook = function(book, snapshot) {
     };
 
     if (!Currency.from_json(obj.currency).is_native()) {
-      obj.issuer = UInt160.json_rewrite(book[side].issuer);
+      obj.issuer = book[side].issuer;
     }
   }
 

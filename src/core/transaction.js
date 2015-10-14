@@ -9,11 +9,11 @@ const utils = require('./utils');
 const sjclcodec = require('sjcl-codec');
 const Amount = require('./amount').Amount;
 const Currency = require('./currency').Currency;
-const UInt160 = require('./uint160').UInt160;
-const SerializedObject = require('./serializedobject').SerializedObject;
 const RippleError = require('./rippleerror').RippleError;
 const hashprefixes = require('./hashprefixes');
 const log = require('./log').internal.sub('transaction');
+const {isValidAddress, decodeAddress} = require('ripple-address-codec');
+const binary = require('ripple-binary-codec');
 
 /**
  * @constructor Transaction
@@ -384,24 +384,32 @@ Transaction.prototype.err = function(error, errorMessage) {
 };
 
 Transaction.prototype.complete = function() {
-  // Auto-fill the secret
-  this._secret = this._secret || this.getSecret();
+  const hasMultiSigners = this.hasMultiSigners();
 
-  if (_.isUndefined(this._secret)) {
-    return this.err('tejSecretUnknown', 'Missing secret');
-  }
+  if (!hasMultiSigners) {
+    // Auto-fill the secret
+    this._secret = this._secret || this.getSecret();
 
-  if (this.remote && !(this.remote.local_signing || this.remote.trusted)) {
-    return this.err(
-      'tejServerUntrusted',
-      'Attempt to give secret to untrusted server');
+    if (_.isUndefined(this._secret)) {
+      return this.err('tejSecretUnknown', 'Missing secret');
+    }
+
+    if (this.remote && !(this.remote.local_signing || this.remote.trusted)) {
+      return this.err(
+        'tejServerUntrusted',
+        'Attempt to give secret to untrusted server');
+    }
   }
 
   if (_.isUndefined(this.tx_json.SigningPubKey)) {
-    try {
-      this.setSigningPubKey(this.getSigningPubKey());
-    } catch (e) {
-      return this.err('tejSecretInvalid', 'Invalid secret');
+    if (hasMultiSigners) {
+      this.setSigningPubKey('');
+    } else {
+      try {
+        this.setSigningPubKey(this.getSigningPubKey());
+      } catch (e) {
+        return this.err('tejSecretInvalid', 'Invalid secret');
+      }
     }
   }
 
@@ -451,7 +459,7 @@ Transaction.prototype.setCanonicalFlag = function() {
 };
 
 Transaction.prototype.serialize = function() {
-  return SerializedObject.from_json(this.tx_json);
+  return binary.encode(this.tx_json);
 };
 
 Transaction.prototype.signingHash = function(testnet) {
@@ -459,22 +467,16 @@ Transaction.prototype.signingHash = function(testnet) {
 };
 
 Transaction.prototype.signingData = function() {
-  const so = new SerializedObject();
-  so.append(hashprefixes.HASH_TX_SIGN_BYTES);
-  so.parse_json(this.tx_json);
-  return so;
+  return binary.encodeForSigning(this.tx_json);
 };
 
 Transaction.prototype.multiSigningData = function(account) {
-  const so = new SerializedObject();
-  so.append(hashprefixes.HASH_TX_MULTISIGN_BYTES);
-  so.parse_json(this.tx_json);
-  so.append(UInt160.from_json(account).to_bytes());
-  return so;
+  return binary.encodeForMultisigning(this.tx_json, account);
 };
 
-Transaction.prototype.hash = function(prefix_, asUINT256, serialized) {
+Transaction.prototype.hash = function(prefix_, serialized_) {
   let prefix;
+  assert(serialized_ === undefined || _.isString(serialized_));
 
   if (typeof prefix_ !== 'string') {
     prefix = hashprefixes.HASH_TX_ID;
@@ -484,9 +486,9 @@ Transaction.prototype.hash = function(prefix_, asUINT256, serialized) {
     prefix = hashprefixes[prefix_];
   }
 
-  const hash = (serialized || this.serialize()).hash(prefix);
-
-  return asUINT256 ? hash : hash.to_hex();
+  const hexPrefix = prefix.toString(16).toUpperCase();
+  const serialized = serialized_ || this.serialize();
+  return utils.sha512half(new Buffer(hexPrefix + serialized, 'hex'));
 };
 
 Transaction.prototype.sign = function(secret) {
@@ -505,7 +507,7 @@ Transaction.prototype.sign = function(secret) {
   }
 
   const keypair = deriveKeypair(secret || this._secret);
-  this.tx_json.TxnSignature = sign(this.signingData().buffer,
+  this.tx_json.TxnSignature = sign(new Buffer(this.signingData(), 'hex'),
     keypair.privateKey);
   this.previousSigningHash = hash;
 
@@ -580,7 +582,7 @@ Transaction.prototype.setLastLedgerSequence = function(sequence) {
     assert(this.remote, 'Unable to set LastLedgerSequence, missing Remote');
 
     this._setUInt32('LastLedgerSequence',
-                    this.remote.getLedgerSequence() + 1
+                    this.remote.getLedgerSequenceSync() + 1
                     + this.getLastLedgerSequenceOffset());
   }
 
@@ -691,14 +693,10 @@ Transaction.prototype.sourceTag = function(tag) {
 };
 
 Transaction.prototype._setAccount = function(name, value) {
-  const uInt160 = UInt160.from_json(value);
-
-  if (!uInt160.is_valid()) {
+  if (!isValidAddress(value)) {
     throw new Error(name + ' must be a valid account');
   }
-
-  this.tx_json[name] = uInt160.to_json();
-
+  this.tx_json[name] = value;
   return this;
 };
 
@@ -722,7 +720,7 @@ Transaction.prototype._setAmount = function(name, amount, options_) {
   if (!(isNative || parsedAmount.currency().is_valid())) {
     throw new Error(name + ' must have a valid currency');
   }
-  if (!(isNative || parsedAmount.issuer().is_valid())) {
+  if (!(isNative || isValidAddress(parsedAmount.issuer()))) {
     throw new Error(name + ' must have a valid issuer');
   }
 
@@ -1175,11 +1173,11 @@ Transaction._rewritePath = function(path) {
     const newNode = { };
 
     if (node.hasOwnProperty('account')) {
-      newNode.account = UInt160.json_rewrite(node.account);
+      newNode.account = node.account;
     }
 
     if (node.hasOwnProperty('issuer')) {
-      newNode.issuer = UInt160.json_rewrite(node.issuer);
+      newNode.issuer = node.issuer;
     }
 
     if (node.hasOwnProperty('currency')) {
@@ -1383,7 +1381,7 @@ Transaction.prototype.offerCancel = function(options_) {
 Transaction._prepareSignerEntry = function(signer) {
   const {account, weight} = signer;
 
-  assert(UInt160.is_valid(account), 'Signer account invalid');
+  assert(isValidAddress(account), 'Signer account invalid');
   assert(_.isNumber(weight), 'Signer weight missing');
   assert(weight > 0 && weight <= 65535, 'Signer weight must be 1-65535');
 
@@ -1605,7 +1603,7 @@ Transaction.prototype.setSigners = function(signers) {
 };
 
 Transaction.prototype.addMultiSigner = function(signer) {
-  assert(UInt160.is_valid(signer.Account), 'Signer must have a valid Account');
+  assert(isValidAddress(signer.Account), 'Signer must have a valid Account');
 
   if (_.isUndefined(this.tx_json.Signers)) {
     this.tx_json.Signers = [];
@@ -1614,8 +1612,8 @@ Transaction.prototype.addMultiSigner = function(signer) {
   this.tx_json.Signers.push({Signer: signer});
 
   this.tx_json.Signers.sort((a, b) => {
-    return UInt160.from_json(a.Signer.Account)
-    .cmp(UInt160.from_json(b.Signer.Account));
+    return (new Buffer(decodeAddress(a.Signer.Account))).compare(
+      new Buffer(decodeAddress(b.Signer.Account)));
   });
 
   return this;
@@ -1658,7 +1656,7 @@ Transaction.prototype.multiSign = function(account, secret) {
 
   const signer = {
     Account: account,
-    TxnSignature: sign(signingData.buffer, keypair.privateKey),
+    TxnSignature: sign(new Buffer(signingData, 'hex'), keypair.privateKey),
     SigningPubKey: keypair.publicKey
   };
 

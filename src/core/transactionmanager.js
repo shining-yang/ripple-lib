@@ -21,7 +21,7 @@ function TransactionManager(account) {
   const self = this;
 
   this._account = account;
-  this._accountID = account._account_id;
+  this._accountID = account._address;
   this._remote = account._remote;
   this._nextSequence = undefined;
   this._maxFee = this._remote.max_fee;
@@ -524,9 +524,9 @@ TransactionManager.prototype._prepareRequest = function(tx) {
     tx.sign();
 
     const serialized = tx.serialize();
-    submitRequest.txBlob(serialized.to_hex());
+    submitRequest.txBlob(serialized);
 
-    const hash = tx.hash(null, null, serialized);
+    const hash = tx.hash(null, serialized);
     tx.addId(hash);
   } else {
     if (tx.hasMultiSigners()) {
@@ -681,7 +681,7 @@ TransactionManager.prototype._request = function(tx) {
     }
   }
 
-  tx.submitIndex = this._remote.getLedgerSequence() + 1;
+  tx.submitIndex = this._remote.getLedgerSequenceSync() + 1;
 
   if (tx.attempts === 0) {
     tx.initialSubmitIndex = tx.submitIndex;
@@ -698,7 +698,8 @@ TransactionManager.prototype._request = function(tx) {
 
   tx.emit('postsubmit');
 
-  submitRequest.timeout(self._submissionTimeout, requestTimeout);
+  submitRequest.setTimeout(self._submissionTimeout);
+  submitRequest.once('timeout', requestTimeout);
 };
 
 /**
@@ -723,6 +724,10 @@ TransactionManager.prototype.submit = function(tx) {
     return;
   }
 
+  tx.once('cleanup', function() {
+    self.getPending().remove(tx);
+  });
+
   if (!_.isNumber(tx.tx_json.Sequence)) {
     // Honor manually-set sequences
     tx.setSequence(this._nextSequence++);
@@ -734,12 +739,7 @@ TransactionManager.prototype.submit = function(tx) {
 
   if (tx.hasMultiSigners()) {
     tx.setResubmittable(false);
-    tx.setSigningPubKey('');
   }
-
-  tx.once('cleanup', function() {
-    self.getPending().remove(tx);
-  });
 
   if (!tx.complete()) {
     this._nextSequence -= 1;

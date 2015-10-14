@@ -4,15 +4,15 @@
 
 const assert = require('assert-diff');
 const lodash = require('lodash');
-const ripple = require('ripple-lib');
 const Remote = require('ripple-lib').Remote;
 const Server = require('ripple-lib').Server;
 const Transaction = require('ripple-lib').Transaction;
-const UInt160 = require('ripple-lib').UInt160;
 const Currency = require('ripple-lib').Currency;
 const Amount = require('ripple-lib').Amount;
 const PathFind = require('ripple-lib')._test.PathFind;
 const Log = require('ripple-lib')._test.Log;
+const ACCOUNT_ONE = require('ripple-lib')._test.constants.ACCOUNT_ONE;
+const RippleError = require('ripple-lib').RippleError;
 
 let options;
 let remote;
@@ -30,7 +30,7 @@ const TX_JSON = {
   Flags: 0,
   TransactionType: 'Payment',
   Account: ADDRESS,
-  Destination: ripple.UInt160.ACCOUNT_ONE,
+  Destination: ACCOUNT_ONE,
   Amount: {
     value: '1',
     currency: 'USD',
@@ -1492,7 +1492,7 @@ describe('Remote', function() {
 
    it('Construct account_tx request', function() {
      let request = remote.requestAccountTransactions({
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        ledger_index_min: -1,
        ledger_index_max: -1,
        limit: 5,
@@ -1503,7 +1503,7 @@ describe('Remote', function() {
      assert.deepEqual(request.message, {
        command: 'account_tx',
        id: undefined,
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        ledger_index_min: -1,
        ledger_index_max: -1,
        binary: true,
@@ -1513,14 +1513,14 @@ describe('Remote', function() {
      });
 
      request = remote.requestAccountTransactions({
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        min_ledger: -1,
        max_ledger: -1
      });
      assert.deepEqual(request.message, {
        command: 'account_tx',
        id: undefined,
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        binary: true,
        ledger_index_min: -1,
        ledger_index_max: -1
@@ -1528,7 +1528,7 @@ describe('Remote', function() {
    });
    it('Construct account_tx request -- no binary', function() {
      const request = remote.requestAccountTransactions({
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        ledger_index_min: -1,
        ledger_index_max: -1,
        limit: 5,
@@ -1540,7 +1540,7 @@ describe('Remote', function() {
      assert.deepEqual(request.message, {
        command: 'account_tx',
        id: undefined,
-       account: UInt160.ACCOUNT_ONE,
+       account: ACCOUNT_ONE,
        ledger_index_min: -1,
        ledger_index_max: -1,
        binary: false,
@@ -1618,7 +1618,7 @@ describe('Remote', function() {
       taker_pays: {
         currency: Currency.from_human('XRP').to_hex()
       },
-      taker: UInt160.ACCOUNT_ONE
+      taker: ACCOUNT_ONE
     });
   });
 
@@ -1645,7 +1645,7 @@ describe('Remote', function() {
       taker_pays: {
         currency: Currency.from_human('XRP').to_hex()
       },
-      taker: UInt160.ACCOUNT_ONE,
+      taker: ACCOUNT_ONE,
       ledger_hash: LEDGER_HASH,
       limit: 10
     });
@@ -1907,25 +1907,102 @@ describe('Remote', function() {
     });
   });
 
-  it('createPathFind', function() {
-    const servers = [
-      makeServer('wss://localhost:5006'),
-      makeServer('wss://localhost:5007')
-    ];
-
-    remote._servers = servers;
-
-    const pathfind = remote.createPathFind({
-      src_account: 'rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
-      dst_account: 'rwxBjBC9fPzyQ9GgPZw6YYLNeRTSx5c2W6',
-      dst_amount: '1/USD/rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
+  describe('createPathFind', function() {
+    const pathfindParams = {
+      src_account: 'r9UHu5CWni1qRY7Q4CfFZLGvXo2pGQy96b',
+      dst_account: 'rB31JZB8o5BvxyvPiRABatGsXwKYVaqGmN',
+      dst_amount: '0.001/USD/rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
       src_currencies: [{
         currency: 'BTC', issuer: 'rwxBjBC9fPzyQ9GgPZw6YYLNeRTSx5c2W6'
       }]
+    };
+    const response1 = {
+      id: 1,
+      result: {
+        alternatives: [],
+        destination_account: 'rB31JZB8o5BvxyvPiRABatGsXwKYVaqGmN',
+        destination_amount: {
+          currency: 'USD',
+          issuer: 'rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
+          value: '0.001'
+        },
+        full_reply: false,
+        id: 1,
+        source_account: 'r9UHu5CWni1qRY7Q4CfFZLGvXo2pGQy96b'
+      },
+      status: 'success',
+      type: 'response'
+    };
+    const response2 = {
+      alternatives: [],
+      destination_account: 'rB31JZB8o5BvxyvPiRABatGsXwKYVaqGmN',
+      destination_amount: {
+        currency: 'USD',
+        issuer: 'rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
+        value: '0.001'
+      },
+      full_reply: true,
+      id: 1,
+      source_account: 'r9UHu5CWni1qRY7Q4CfFZLGvXo2pGQy96b',
+      type: 'path_find'
+    };
+
+    it('createPathFind', function(done) {
+      const servers = [
+        makeServer('wss://localhost:5006')
+      ];
+
+      remote._servers = servers;
+
+      servers[0]._request = function(req) {
+        setTimeout(() => {
+          req.emit('success', response1, this);
+          setTimeout(() => {
+            remote._handleMessage(response2, this);
+          }, 5);
+        }, 5);
+      };
+
+      remote.createPathFind(pathfindParams, (err, result) => {
+        (function() {})(err);
+        assert.deepEqual(result, response2);
+        done();
+      });
+
     });
 
-    // TODO: setup a mock server to provide a response
-    pathfind.on('update', message => console.log(message));
+    it('createPathFind - timeout', function(done) {
+      const servers = [
+        makeServer('wss://localhost:5006'),
+        makeServer('wss://localhost:5007')
+      ];
+
+      remote.submission_timeout = 50;
+      remote._servers = servers;
+      const pathfind = remote.createPathFind(pathfindParams);
+
+      pathfind.on('error', (error) => {
+        assert(error instanceof RippleError);
+        assert.strictEqual(error.result, 'tejTimeout');
+        done();
+      });
+    });
+
+    it('createPathFind - throw error without callback if already running', function() {
+      const servers = [
+        makeServer('wss://localhost:5006'),
+        makeServer('wss://localhost:5007')
+      ];
+
+      remote._servers = servers;
+
+      const pathfind = remote.createPathFind(pathfindParams);
+      pathfind.on('error', function() { });
+      assert.throws(
+        function() {
+          remote.createPathFind(pathfindParams);
+        }, Error);
+    });
   });
 
   it('Construct path_find create request', function() {
@@ -1963,6 +2040,22 @@ describe('Remote', function() {
       command: 'path_find',
       id: undefined,
       subcommand: 'close'
+    });
+  });
+
+  it('Construct gateway_balances request', function() {
+    const request = remote.requestGatewayBalances({
+      account: 'rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
+      hotwallet: 'rwxBjBC9fPzyQ9GgPZw6YYLNeRTSx5',
+      strict: true
+    });
+
+    assert.deepEqual(request.message, {
+      command: 'gateway_balances',
+      id: undefined,
+      account: 'rGr9PjmVe7MqEXTSbd3njhgJc2s5vpHV54',
+      hotwallet: 'rwxBjBC9fPzyQ9GgPZw6YYLNeRTSx5',
+      strict: true
     });
   });
 
